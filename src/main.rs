@@ -1,7 +1,10 @@
 use ffmpeg_next as ffmpeg;
 use futures::future::join_all;
 use std::path::Path;
+use std::io::Write;
 use tokio::sync::mpsc;
+use yuvutils_rs::{yuv420_to_rgb, YuvStandardMatrix, YuvPlanarImage, YuvRange};
+use image::{ImageBuffer, Rgb};
 
 const SAVE_ENABLED: bool = true; // 是否启用保存图片功能
 
@@ -14,7 +17,6 @@ pub struct ProcessConfig {
     pub max_concurrent_saves: usize,
     pub image_format: String, // "jpg", "png", etc.
     pub jpeg_quality: i32,    // 0-100 for JPEG quality
-    pub use_opencl: bool,     // Mac上使用OpenCL加速（可选）
 }
 
 impl Default for ProcessConfig {
@@ -24,9 +26,8 @@ impl Default for ProcessConfig {
             output_dir: "extracted_frames".to_string(),
             save_images: false, // 默认不保存图片
             max_concurrent_saves: 4,
-            image_format: "jpg".to_string(),
+            image_format: "jpg".to_string(), // 修改默认格式为 jpg
             jpeg_quality: 90,
-            use_opencl: false, // 默认不使用OpenCL
         }
     }
 }
@@ -49,15 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🎬 FFmpeg 初始化成功!");
     println!("📦 FFmpeg 已成功集成到 SubSnap 项目中");
-    println!("🍎 Mac 设备优化版本");
+    println!("🍎 Mac 设备优化版本 (使用 yuvutils-rs)");
 
     // 显示一些基本信息
     println!("\n📋 可用功能示例:");
     println!("✅ FFmpeg 库已初始化");
     println!("✅ 可以进行视频/音频处理");
     println!("✅ 支持多种媒体格式");
-    println!("✅ OpenCV 异步图片保存已集成 (可选)");
-    println!("✅ OpenCL 加速支持 (Mac 优化)");
+    println!("✅ yuvutils-rs YUV转RGB转换已集成");
+    println!("✅ 轻量级图片保存支持 (无OpenCV依赖)");
 
     // 演示一些简单的 ffmpeg-next 功能
     demo_ffmpeg_features().await?;
@@ -79,8 +80,8 @@ async fn demo_ffmpeg_features() -> Result<(), Box<dyn std::error::Error>> {
     // 检查最优解码器
     check_optimal_decoders()?;
 
-    // 检查 OpenCV OpenCL 支持（Mac 优化）
-    check_opencv_opencl_support().await?;
+    // 检查 yuvutils-rs 支持
+    check_yuvutils_support().await?;
 
     // 演示视频帧拆分功能（只在有有效文件时）
     println!("\n🎞️  准备演示视频帧拆分功能...");
@@ -92,44 +93,24 @@ async fn demo_ffmpeg_features() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_saves: 4,
         image_format: "jpg".to_string(),
         jpeg_quality: 90,
-        use_opencl: true, // 在Mac上尝试OpenCL加速
     };
 
-    if let Err(e) = demo_frame_extraction_with_opencv(config).await {
+    if let Err(e) = demo_frame_extraction_with_yuvutils(config).await {
         println!("  ⚠️  帧保存演示跳过: {}", e);
     }
 
     Ok(())
 }
 
-async fn check_opencv_opencl_support() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🔧 检查 OpenCV OpenCL 支持 (Mac 优化):");
+async fn check_yuvutils_support() -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n🔧 检查 yuvutils-rs YUV转换支持:");
 
-    // 检查 OpenCL 支持
-    match opencv::core::have_opencl() {
-        Ok(true) => {
-            println!("  ✅ OpenCL 支持可用");
-
-            // 尝试使用 OpenCL
-            if let Ok(_) = opencv::core::use_opencl() {
-                println!("  🚀 OpenCL 已启用 (适用于Mac GPU加速)");
-            } else {
-                println!("  ⚠️  OpenCL 启用失败，将使用 CPU 模式");
-            }
-        }
-        Ok(false) => {
-            println!("  ⚠️  OpenCL 支持不可用，将使用 CPU 模式");
-        }
-        Err(_) => {
-            println!("  ⚠️  检查 OpenCL 支持时出错，将使用 CPU 模式");
-        }
-    }
-
-    // 显示Mac特有的加速提示
-    println!("  🍎 Mac 设备提示:");
-    println!("    - Intel Mac: 可能支持 OpenCL GPU 加速");
-    println!("    - Apple Silicon Mac: 主要依赖 CPU 优化");
-    println!("    - 建议使用多线程并发提升性能");
+    println!("  ✅ yuvutils-rs 库已加载");
+    println!("  🚀 支持高性能 YUV420 到 RGB 转换");
+    println!("  📐 支持多种色彩标准 (BT.601, BT.709, BT.2020)");
+    println!("  🎨 支持全范围和限制范围色度");
+    println!("  💻 纯 Rust 实现，无外部依赖");
+    println!("  🍎 Mac 设备优化: CPU向量化加速");
 
     Ok(())
 }
@@ -246,7 +227,7 @@ fn calculate_decoding_complexity(width: u32, height: u32) -> &'static str {
     }
 }
 
-async fn demo_frame_extraction_with_opencv(
+async fn demo_frame_extraction_with_yuvutils(
     config: ProcessConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ffmpeg::media;
@@ -254,7 +235,7 @@ async fn demo_frame_extraction_with_opencv(
     println!(
         "\n🎞️  开始演示视频帧拆分 {}:",
         if config.save_images {
-            "(带OpenCV异步保存)"
+            "(带yuvutils-rs保存)"
         } else {
             "(仅提取)"
         }
@@ -274,12 +255,6 @@ async fn demo_frame_extraction_with_opencv(
         println!("  📂 输出目录: {}", config.output_dir);
         println!("  🖼️  图片格式: {}", config.image_format);
         println!("  🔄 最大并发保存: {}", config.max_concurrent_saves);
-
-        if config.use_opencl {
-            println!("  🚀 OpenCL加速: 启用 (Mac 优化)");
-        } else {
-            println!("  💻 处理模式: CPU");
-        }
     } else {
         println!("  🔍 模式: 仅提取帧，不保存图片");
     }
@@ -354,7 +329,7 @@ async fn demo_frame_extraction_with_opencv(
     println!(
         "  🚀 开始按FPS提取帧{}:",
         if config.save_images {
-            "并异步保存"
+            "并保存"
         } else {
             ""
         }
@@ -380,9 +355,9 @@ async fn demo_frame_extraction_with_opencv(
                         if let Ok(frame_data) =
                             convert_frame_to_data(&decoded, extracted_count, timestamp)
                         {
-                            // 非阻塞发送，如果队列满了就跳过这一帧
-                            if let Err(_) = sender.try_send(frame_data) {
-                                println!("    ⚠️  保存队列已满，跳过帧 #{}", extracted_count);
+                            // 阻塞等待队列有空位，保证所有帧都能被保存
+                            if let Err(e) = sender.send(frame_data).await {
+                                println!("    ❌ 保存队列发送失败: {}", e);
                             }
                         }
                     }
@@ -457,13 +432,13 @@ async fn demo_frame_extraction_with_opencv(
     if let Some(result) = save_result {
         match result {
             Ok(saved_count) => {
-                println!("  💾 异步保存完成: {} 张图片已保存", saved_count);
+                println!("  💾 保存完成: {} 张图片已保存", saved_count);
             }
             Err(e) => {
                 println!("  ❌ 保存过程中出现错误: {}", e);
             }
         }
-        println!("  💡 优化措施: 多线程解码 + 异步保存 + OpenCL加速(Mac) + 非阻塞管道");
+        println!("  💡 优化措施: 多线程解码 + yuvutils-rs保存 + 非阻塞管道");
     } else {
         println!("  💡 优化措施: 多线程解码 + 快速提取 (无IO开销)");
     }
@@ -518,6 +493,119 @@ fn convert_frame_to_data(
     })
 }
 
+// 异步转换 YUV 到 RGB
+async fn convert_frame_to_rgb_async(
+    frame_data: FrameData,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let rgb_data = match frame_data.format {
+        ffmpeg::util::format::Pixel::YUV420P => {
+            let y_size = (frame_data.width * frame_data.height) as usize;
+            let uv_size = y_size / 4;
+
+            // 克隆数据以确保生命周期
+            let data = frame_data.data.clone();
+            let width = frame_data.width;
+            let height = frame_data.height;
+            
+            tokio::task::spawn_blocking(move || {
+                let y_plane = &data[0..y_size];
+                let u_plane = &data[y_size..y_size + uv_size];
+                let v_plane = &data[y_size + uv_size..y_size + 2 * uv_size];
+
+                let yuv_image = YuvPlanarImage {
+                    y_plane,
+                    y_stride: width as u32,
+                    u_plane,
+                    u_stride: width as u32 / 2,
+                    v_plane,
+                    v_stride: width as u32 / 2,
+                    width: width as u32,
+                    height: height as u32,
+                };
+
+                let mut rgb_buf = vec![0u8; (width * height * 3) as usize];
+                yuv420_to_rgb(
+                    &yuv_image,
+                    &mut rgb_buf,
+                    width as u32 * 3,
+                    YuvRange::Full,
+                    YuvStandardMatrix::Bt709,
+                )?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(rgb_buf)
+            })
+            .await??
+        }
+        ffmpeg::util::format::Pixel::RGB24 => frame_data.data,
+        _ => {
+            return Err(format!("不支持的像素格式: {:?}", frame_data.format).into());
+        }
+    };
+
+    Ok(rgb_data)
+}
+
+// 异步保存图像
+async fn save_image_async(
+    rgb_data: Vec<u8>,
+    frame_data: FrameData,
+    config: ProcessConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filename = format!(
+        "{}/frame_{:06}_{:.2}s.{}",
+        config.output_dir, frame_data.frame_number, frame_data.timestamp, config.image_format
+    );
+
+    // 创建图像缓冲区
+    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(
+        frame_data.width,
+        frame_data.height,
+        rgb_data.clone(),
+    ).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "无法创建图像缓冲区"))?;
+
+    // 使用 tokio::task::spawn_blocking 在后台线程执行 I/O 操作
+    tokio::task::spawn_blocking(move || {
+        match config.image_format.as_str() {
+            "jpg" | "jpeg" => {
+                img.save_with_format(&filename, image::ImageFormat::Jpeg)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+            "png" => {
+                img.save_with_format(&filename, image::ImageFormat::Png)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+            "ppm" => {
+                let mut file = std::fs::File::create(&filename)?;
+                writeln!(file, "P6\n{} {}\n255", frame_data.width, frame_data.height)?;
+                file.write_all(&rgb_data)?;
+                Ok(())
+            }
+            _ => {
+                Err(format!("不支持的图像格式: {}", config.image_format).into())
+            }
+        }
+    })
+    .await??;
+
+    Ok(())
+}
+
+// 修改原有的 save_frame_as_image 函数
+fn save_frame_as_image(
+    frame_data: FrameData,
+    config: ProcessConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 使用 tokio::runtime::Runtime 来运行异步代码
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        // 1. 异步转换 YUV 到 RGB
+        let rgb_data = convert_frame_to_rgb_async(frame_data.clone()).await?;
+        
+        // 2. 异步保存图像
+        save_image_async(rgb_data, frame_data, config).await
+    })
+}
+
+// 修改 process_frames_async 函数
 async fn process_frames_async(
     mut receiver: mpsc::Receiver<FrameData>,
     config: ProcessConfig,
@@ -525,27 +613,10 @@ async fn process_frames_async(
     let mut saved_count = 0;
     let mut tasks = Vec::new();
 
-    println!("  🎨 OpenCV 异步图片保存任务已启动 (Mac 优化)");
-
-    // 尝试初始化OpenCL上下文（如果启用）
-    let opencl_enabled = if config.use_opencl {
-        init_opencl_context().await.unwrap_or_else(|e| {
-            println!("    ⚠️  OpenCL 初始化失败，使用CPU模式: {}", e);
-            false
-        })
-    } else {
-        false
-    };
-
-    if opencl_enabled {
-        println!("  🚀 OpenCL 加速已启用 (Mac GPU 优化)");
-    } else {
-        println!("  💻 使用 CPU 模式");
-    }
+    println!("  🎨 yuvutils-rs 图片保存任务已启动");
 
     while let Some(frame_data) = receiver.recv().await {
         let task_config = config.clone();
-        let task_use_opencl = opencl_enabled;
 
         // 控制并发数量
         if tasks.len() >= config.max_concurrent_saves {
@@ -560,8 +631,12 @@ async fn process_frames_async(
         }
 
         // 启动新的保存任务
-        let task = tokio::task::spawn_blocking(move || {
-            save_frame_as_image(frame_data, task_config, task_use_opencl)
+        let task = tokio::spawn(async move {
+            // 1. 异步转换 YUV 到 RGB
+            let rgb_data = convert_frame_to_rgb_async(frame_data.clone()).await?;
+            
+            // 2. 异步保存图像
+            save_image_async(rgb_data, frame_data, task_config).await
         });
 
         tasks.push(task);
@@ -579,169 +654,6 @@ async fn process_frames_async(
 
     println!("  ✅ 所有图片保存任务完成");
     Ok(saved_count)
-}
-
-fn save_frame_as_image(
-    frame_data: FrameData,
-    config: ProcessConfig,
-    opencl_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use opencv::imgcodecs::*;
-
-    // 构造输出文件名
-    let filename = format!(
-        "{}/frame_{:06}_{:.2}s.{}",
-        config.output_dir, frame_data.frame_number, frame_data.timestamp, config.image_format
-    );
-
-    // 根据 FFmpeg 像素格式转换为 OpenCV Mat
-    let mut mat = convert_ffmpeg_frame_to_opencv_mat(&frame_data)?;
-
-    // 如果使用OpenCL，尝试在GPU上处理
-    if opencl_enabled {
-        if let Ok(processed_mat) = process_with_opencl(&mat) {
-            mat = processed_mat;
-        }
-    }
-
-    // 设置保存参数
-    let mut params = opencv::core::Vector::<i32>::new();
-
-    match config.image_format.to_lowercase().as_str() {
-        "jpg" | "jpeg" => {
-            params.push(IMWRITE_JPEG_QUALITY);
-            params.push(config.jpeg_quality);
-        }
-        "png" => {
-            params.push(IMWRITE_PNG_COMPRESSION);
-            params.push(3); // 0-9, 3 是平衡压缩率和速度的选择
-        }
-        _ => {}
-    }
-
-    // 保存图片
-    imwrite(&filename, &mat, &params)?;
-
-    Ok(())
-}
-
-fn convert_ffmpeg_frame_to_opencv_mat(
-    frame_data: &FrameData,
-) -> Result<opencv::core::Mat, Box<dyn std::error::Error + Send + Sync>> {
-    use opencv::core::*;
-
-    let height = frame_data.height as i32;
-    let width = frame_data.width as i32;
-
-    // 根据 FFmpeg 像素格式创建对应的 OpenCV Mat
-    match frame_data.format {
-        ffmpeg::util::format::Pixel::YUV420P => {
-            // YUV420P 格式处理 - 使用 I420 格式直接转换
-            let y_size = (width * height) as usize;
-            let uv_size = y_size / 4;
-
-            if frame_data.data.len() < y_size + uv_size * 2 {
-                return Err(format!("YUV420P 数据长度不足: 需要 {} 字节，实际 {} 字节", 
-                                 y_size + uv_size * 2, frame_data.data.len()).into());
-            }
-
-            // 创建连续的 YUV 数据 Mat
-            let yuv_data = Mat::from_slice(&frame_data.data)?;
-            let yuv_mat = yuv_data.reshape(1, height * 3 / 2)?;
-
-            // 转换 YUV I420 到 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &yuv_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_YUV2BGR_I420,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
-        }
-        ffmpeg::util::format::Pixel::RGB24 => {
-            // RGB24 格式
-            let expected_size = (width * height * 3) as usize;
-            if frame_data.data.len() < expected_size {
-                return Err(format!("RGB24 数据长度不足: 需要 {} 字节，实际 {} 字节", 
-                                 expected_size, frame_data.data.len()).into());
-            }
-
-            let rgb_data = Mat::from_slice(&frame_data.data[0..expected_size])?;
-            let rgb_mat = rgb_data.reshape(3, height)?;
-
-            // 转换 RGB 到 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &rgb_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_RGB2BGR,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
-        }
-        _ => {
-            // 对于其他格式，尝试作为灰度图像处理
-            let expected_size = (width * height) as usize;
-            let actual_size = frame_data.data.len().min(expected_size);
-            
-            let gray_data = Mat::from_slice(&frame_data.data[0..actual_size])?;
-            let gray_mat = gray_data.reshape(1, height)?;
-
-            // 转换为 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &gray_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_GRAY2BGR,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
-        }
-    }
-}
-
-async fn init_opencl_context() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    tokio::task::spawn_blocking(
-        || -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            use opencv::core::*;
-
-            // 检查 OpenCL 是否可用
-            if !have_opencl()? {
-                return Ok(false);
-            }
-
-            // 尝试启用 OpenCL
-            use_opencl()?;
-
-            // 测试 OpenCL 功能
-            let test_mat = Mat::zeros(100, 100, CV_8UC3)?.to_mat()?;
-            let mut _result_mat = Mat::default();
-
-            // 简单的测试操作 - 创建一个简单的测试而不用 gaussian_blur
-            let _test_result = test_mat.clone();
-
-            Ok(true)
-        },
-    )
-    .await?
-}
-
-fn process_with_opencl(
-    mat: &opencv::core::Mat,
-) -> Result<opencv::core::Mat, Box<dyn std::error::Error + Send + Sync>> {
-    // 这里可以添加 OpenCL 优化的图像处理操作
-    // 例如：调整大小、模糊、锐化等
-    // 对于Mac，OpenCL 主要利用集成显卡或独立显卡
-
-    // 目前直接返回原图，你可以根据需要添加具体的图像处理
-    Ok(mat.clone())
 }
 
 fn optimize_decoder_for_speed(
@@ -764,7 +676,5 @@ fn create_optimized_input_context(
     let input = format::input(&Path::new(input_path))?;
 
     // 可以在这里添加更多优化设置
-    // 例如缓冲区大小、预读取选项等
-
     Ok(input)
 }
