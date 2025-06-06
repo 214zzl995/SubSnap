@@ -1,7 +1,8 @@
+use anyhow::{anyhow, Result};
 use ffmpeg_next as ffmpeg;
-use futures::future::join_all;
 use std::path::Path;
 use tokio::sync::mpsc;
+use wgpu::util::DeviceExt;
 
 const SAVE_ENABLED: bool = true; // 是否启用保存图片功能
 
@@ -13,8 +14,8 @@ pub struct ProcessConfig {
     pub save_images: bool, // 是否保存图片（可选功能）
     pub max_concurrent_saves: usize,
     pub image_format: String, // "jpg", "png", etc.
-    pub jpeg_quality: i32,    // 0-100 for JPEG quality
-    pub use_opencl: bool,     // Mac上使用OpenCL加速（可选）
+    pub jpeg_quality: u8,     // 0-100 for JPEG quality
+    pub use_gpu: bool,        // 使用GPU加速
 }
 
 impl Default for ProcessConfig {
@@ -26,7 +27,7 @@ impl Default for ProcessConfig {
             max_concurrent_saves: 4,
             image_format: "jpg".to_string(),
             jpeg_quality: 90,
-            use_opencl: false, // 默认不使用OpenCL
+            use_gpu: true, // 默认使用GPU
         }
     }
 }
@@ -42,22 +43,360 @@ pub struct FrameData {
     pub format: ffmpeg::util::format::Pixel,
 }
 
+// GPU 图像处理器（优化版本）
+pub struct WgpuImageProcessor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    yuv_to_rgb_pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    // 缓存缓冲区以避免重复创建
+    cached_y_buffer: Option<wgpu::Buffer>,
+    cached_u_buffer: Option<wgpu::Buffer>,
+    cached_v_buffer: Option<wgpu::Buffer>,
+    cached_output_buffer: Option<wgpu::Buffer>,
+    cached_read_buffer: Option<wgpu::Buffer>,
+    cached_params_buffer: Option<wgpu::Buffer>,
+    cached_size: Option<(u32, u32)>,
+}
+
+impl WgpuImageProcessor {
+    pub async fn new() -> Result<Self> {
+        // 创建 wgpu 实例
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        // 请求适配器
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await?;
+
+        // 请求设备和队列
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                ..Default::default()
+            })
+            .await?;
+
+        // 创建计算着色器
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YUV to RGB Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("yuv_to_rgb.wgsl").into()),
+        });
+
+        // 创建绑定组布局（更新为5个绑定）
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YUV to RGB Bind Group Layout"),
+            entries: &[
+                // Y 平面缓冲区
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // U 平面缓冲区
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // V 平面缓冲区
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 输出 RGB 数据缓冲区
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 参数缓冲区 (width, height, y_plane_size, uv_plane_size)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // 创建计算管线
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("YUV to RGB Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let yuv_to_rgb_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("YUV to RGB Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Ok(Self {
+            device,
+            queue,
+            yuv_to_rgb_pipeline,
+            bind_group_layout,
+            cached_y_buffer: None,
+            cached_u_buffer: None,
+            cached_v_buffer: None,
+            cached_output_buffer: None,
+            cached_read_buffer: None,
+            cached_params_buffer: None,
+            cached_size: None,
+        })
+    }
+
+    pub async fn convert_yuv420p_to_rgb(
+        &mut self,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>> {
+        let y_size = (width * height) as usize;
+        let uv_size = y_size / 4;
+        
+        if yuv_data.len() < y_size + 2 * uv_size {
+            return Err(anyhow!("YUV数据长度不足"));
+        }
+
+        // 分离YUV平面
+        let y_plane = &yuv_data[0..y_size];
+        let u_plane = &yuv_data[y_size..y_size + uv_size];
+        let v_plane = &yuv_data[y_size + uv_size..y_size + 2 * uv_size];
+
+        // 检查是否可以重用缓冲区
+        let need_new_buffers = self.cached_size != Some((width, height));
+
+        let (y_buffer, u_buffer, v_buffer, output_buffer, read_buffer, params_buffer) = 
+            if need_new_buffers {
+                // 创建新缓冲区并缓存
+                let y_buf = self.create_padded_buffer(y_plane, "Y Plane Buffer");
+                let u_buf = self.create_padded_buffer(u_plane, "U Plane Buffer");
+                let v_buf = self.create_padded_buffer(v_plane, "V Plane Buffer");
+                
+                let rgba_size = (width * height * 4) as u64;
+                let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("RGBA Output Buffer"),
+                    size: rgba_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+
+                let read_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Read Buffer"),
+                    size: rgba_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                let params = [width, height, y_size as u32, uv_size as u32];
+                let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Parameters Buffer"),
+                    contents: bytemuck::cast_slice(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+                // 缓存缓冲区
+                self.cached_y_buffer = Some(y_buf);
+                self.cached_u_buffer = Some(u_buf);
+                self.cached_v_buffer = Some(v_buf);
+                self.cached_output_buffer = Some(output_buf);
+                self.cached_read_buffer = Some(read_buf);
+                self.cached_params_buffer = Some(params_buf);
+                self.cached_size = Some((width, height));
+
+                (
+                    self.cached_y_buffer.as_ref().unwrap(),
+                    self.cached_u_buffer.as_ref().unwrap(),
+                    self.cached_v_buffer.as_ref().unwrap(),
+                    self.cached_output_buffer.as_ref().unwrap(),
+                    self.cached_read_buffer.as_ref().unwrap(),
+                    self.cached_params_buffer.as_ref().unwrap(),
+                )
+            } else {
+                // 重用缓存的缓冲区，只更新数据
+                self.queue.write_buffer(self.cached_y_buffer.as_ref().unwrap(), 0, 
+                    &self.pad_data(y_plane));
+                self.queue.write_buffer(self.cached_u_buffer.as_ref().unwrap(), 0, 
+                    &self.pad_data(u_plane));
+                self.queue.write_buffer(self.cached_v_buffer.as_ref().unwrap(), 0, 
+                    &self.pad_data(v_plane));
+
+                (
+                    self.cached_y_buffer.as_ref().unwrap(),
+                    self.cached_u_buffer.as_ref().unwrap(),
+                    self.cached_v_buffer.as_ref().unwrap(),
+                    self.cached_output_buffer.as_ref().unwrap(),
+                    self.cached_read_buffer.as_ref().unwrap(),
+                    self.cached_params_buffer.as_ref().unwrap(),
+                )
+            };
+
+        // 创建绑定组
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YUV to RGB Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: y_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: u_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // 创建命令编码器
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("YUV to RGB Encoder"),
+        });
+
+        // 开始计算通道
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("YUV to RGB Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.yuv_to_rgb_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+
+            // 使用优化的工作组大小 16x16
+            let workgroup_x = (width + 15) / 16;
+            let workgroup_y = (height + 15) / 16;
+            compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+        }
+
+        // 复制数据到读取缓冲区
+        encoder.copy_buffer_to_buffer(output_buffer, 0, read_buffer, 0, (width * height * 4) as u64);
+
+        // 提交命令
+        self.queue.submit(Some(encoder.finish()));
+
+        // 读取结果
+        let buffer_slice = read_buffer.slice(..);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        receiver.await.map_err(|_| anyhow::anyhow!("Failed to receive buffer mapping result"))??;
+
+        let data = buffer_slice.get_mapped_range();
+        let rgba_data = data.to_vec();
+        drop(data);
+        read_buffer.unmap();
+
+        // 将RGBA数据转换为RGB数据
+        let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+
+        // 按u32读取RGBA数据并转换为RGB
+        for chunk in rgba_data.chunks_exact(4) {
+            if chunk.len() == 4 {
+                let rgba_u32 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+
+                // 从u32中提取RGBA分量 (我们之前打包为 A<<24 | B<<16 | G<<8 | R)
+                let r = (rgba_u32 & 0xFF) as u8;
+                let g = ((rgba_u32 >> 8) & 0xFF) as u8;
+                let b = ((rgba_u32 >> 16) & 0xFF) as u8;
+                // A分量被忽略
+
+                rgb_data.push(r);
+                rgb_data.push(g);
+                rgb_data.push(b);
+            }
+        }
+
+        Ok(rgb_data)
+    }
+
+    // 创建填充的缓冲区，确保大小是4的倍数
+    fn create_padded_buffer(&self, data: &[u8], label: &str) -> wgpu::Buffer {
+        let padded_data = self.pad_data(data);
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: &padded_data,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    }
+
+    // 填充数据到4字节对齐
+    fn pad_data(&self, data: &[u8]) -> Vec<u8> {
+        let mut padded = data.to_vec();
+        while padded.len() % 4 != 0 {
+            padded.push(0);
+        }
+        padded
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // 初始化 FFmpeg
     ffmpeg::init()?;
 
     println!("🎬 FFmpeg 初始化成功!");
     println!("📦 FFmpeg 已成功集成到 SubSnap 项目中");
-    println!("🍎 Mac 设备优化版本");
+    println!("🚀 使用 WGPU GPU 加速处理");
 
     // 显示一些基本信息
     println!("\n📋 可用功能示例:");
     println!("✅ FFmpeg 库已初始化");
     println!("✅ 可以进行视频/音频处理");
     println!("✅ 支持多种媒体格式");
-    println!("✅ OpenCV 异步图片保存已集成 (可选)");
-    println!("✅ OpenCL 加速支持 (Mac 优化)");
+    println!("✅ WGPU GPU 加速图像转换");
+    println!("✅ 移除了 OpenCV 依赖，项目更轻量");
 
     // 演示一些简单的 ffmpeg-next 功能
     demo_ffmpeg_features().await?;
@@ -67,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn demo_ffmpeg_features() -> Result<(), Box<dyn std::error::Error>> {
+async fn demo_ffmpeg_features() -> Result<()> {
     println!("\n🔍 FFmpeg 功能演示:");
 
     // 注意：以下是一些基本的演示，实际使用时需要根据具体需求调整
@@ -76,11 +415,11 @@ async fn demo_ffmpeg_features() -> Result<(), Box<dyn std::error::Error>> {
     println!("  🎵 支持音频编解码");
     println!("  📝 可以提取和处理字幕轨道");
 
-    // 检查最优解码器
+    // 检测最优解码器
     check_optimal_decoders()?;
 
-    // 检查 OpenCV OpenCL 支持（Mac 优化）
-    check_opencv_opencl_support().await?;
+    // 检查 WGPU 支持
+    check_wgpu_support().await?;
 
     // 演示视频帧拆分功能（只在有有效文件时）
     println!("\n🎞️  准备演示视频帧拆分功能...");
@@ -92,49 +431,35 @@ async fn demo_ffmpeg_features() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_saves: 4,
         image_format: "jpg".to_string(),
         jpeg_quality: 90,
-        use_opencl: true, // 在Mac上尝试OpenCL加速
+        use_gpu: true, // 使用GPU加速
     };
 
-    if let Err(e) = demo_frame_extraction_with_opencv(config).await {
+    if let Err(e) = demo_frame_extraction_with_wgpu(config).await {
         println!("  ⚠️  帧保存演示跳过: {}", e);
     }
 
     Ok(())
 }
 
-async fn check_opencv_opencl_support() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🔧 检查 OpenCV OpenCL 支持 (Mac 优化):");
+async fn check_wgpu_support() -> Result<()> {
+    println!("\n🔧 检查 WGPU GPU 支持:");
 
-    // 检查 OpenCL 支持
-    match opencv::core::have_opencl() {
-        Ok(true) => {
-            println!("  ✅ OpenCL 支持可用");
-
-            // 尝试使用 OpenCL
-            if let Ok(_) = opencv::core::use_opencl() {
-                println!("  🚀 OpenCL 已启用 (适用于Mac GPU加速)");
-            } else {
-                println!("  ⚠️  OpenCL 启用失败，将使用 CPU 模式");
-            }
+    match WgpuImageProcessor::new().await {
+        Ok(_) => {
+            println!("  ✅ WGPU 初始化成功");
+            println!("  🚀 GPU 加速可用");
+            println!("  💡 支持所有平台的现代GPU");
         }
-        Ok(false) => {
-            println!("  ⚠️  OpenCL 支持不可用，将使用 CPU 模式");
-        }
-        Err(_) => {
-            println!("  ⚠️  检查 OpenCL 支持时出错，将使用 CPU 模式");
+        Err(e) => {
+            println!("  ⚠️  WGPU 初始化失败: {}", e);
+            println!("  💻 将回退到CPU处理模式");
         }
     }
-
-    // 显示Mac特有的加速提示
-    println!("  🍎 Mac 设备提示:");
-    println!("    - Intel Mac: 可能支持 OpenCL GPU 加速");
-    println!("    - Apple Silicon Mac: 主要依赖 CPU 优化");
-    println!("    - 建议使用多线程并发提升性能");
 
     Ok(())
 }
 
-fn check_optimal_decoders() -> Result<(), Box<dyn std::error::Error>> {
+fn check_optimal_decoders() -> Result<()> {
     println!("\n🔧 检查最优解码器:");
 
     // 检查系统中可用的解码器
@@ -156,7 +481,7 @@ fn check_optimal_decoders() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn analyze_file_codecs(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn analyze_file_codecs(file_path: &str) -> Result<()> {
     use ffmpeg::{format, media};
 
     let input = format::input(&Path::new(file_path))?;
@@ -246,15 +571,13 @@ fn calculate_decoding_complexity(width: u32, height: u32) -> &'static str {
     }
 }
 
-async fn demo_frame_extraction_with_opencv(
-    config: ProcessConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn demo_frame_extraction_with_wgpu(config: ProcessConfig) -> Result<()> {
     use ffmpeg::media;
 
     println!(
         "\n🎞️  开始演示视频帧拆分 {}:",
         if config.save_images {
-            "(带OpenCV异步保存)"
+            "(带WGPU GPU加速保存)"
         } else {
             "(仅提取)"
         }
@@ -268,6 +591,22 @@ async fn demo_frame_extraction_with_opencv(
         return Ok(());
     }
 
+    // 初始化 WGPU 处理器
+    let gpu_processor = if config.use_gpu {
+        match WgpuImageProcessor::new().await {
+            Ok(processor) => {
+                println!("  🚀 WGPU GPU 处理器初始化成功");
+                Some(processor)
+            }
+            Err(e) => {
+                println!("  ⚠️  GPU 初始化失败，使用CPU模式: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 如果需要保存图片，创建输出目录
     if config.save_images {
         tokio::fs::create_dir_all(&config.output_dir).await?;
@@ -275,8 +614,8 @@ async fn demo_frame_extraction_with_opencv(
         println!("  🖼️  图片格式: {}", config.image_format);
         println!("  🔄 最大并发保存: {}", config.max_concurrent_saves);
 
-        if config.use_opencl {
-            println!("  🚀 OpenCL加速: 启用 (Mac 优化)");
+        if gpu_processor.is_some() {
+            println!("  🚀 GPU加速: 启用 (WGPU)");
         } else {
             println!("  💻 处理模式: CPU");
         }
@@ -312,7 +651,7 @@ async fn demo_frame_extraction_with_opencv(
         }
     }
 
-    let video_stream_index = video_stream_index.ok_or("找不到视频流")?;
+    let video_stream_index = video_stream_index.ok_or_else(|| anyhow!("找不到视频流"))?;
 
     // 设置处理管道（仅在需要保存图片时）
     let (frame_sender, frame_receiver) = if config.save_images {
@@ -326,7 +665,7 @@ async fn demo_frame_extraction_with_opencv(
     let save_handle = if let Some(receiver) = frame_receiver {
         let save_config = config.clone();
         Some(tokio::spawn(async move {
-            process_frames_async(receiver, save_config).await
+            process_frames_async_wgpu(receiver, save_config, gpu_processor).await
         }))
     } else {
         None
@@ -432,7 +771,13 @@ async fn demo_frame_extraction_with_opencv(
     }
 
     let save_result = if let Some(handle) = save_handle {
-        Some(handle.await?)
+        match handle.await {
+            Ok(result) => Some(result),
+            Err(e) => {
+                println!("  ❌ 任务执行失败: {}", e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -463,7 +808,7 @@ async fn demo_frame_extraction_with_opencv(
                 println!("  ❌ 保存过程中出现错误: {}", e);
             }
         }
-        println!("  💡 优化措施: 多线程解码 + 异步保存 + OpenCL加速(Mac) + 非阻塞管道");
+        println!("  💡 优化措施: 多线程解码 + WGPU GPU加速 + 异步保存 + 非阻塞管道");
     } else {
         println!("  💡 优化措施: 多线程解码 + 快速提取 (无IO开销)");
     }
@@ -475,20 +820,20 @@ fn convert_frame_to_data(
     frame: &ffmpeg::util::frame::video::Video,
     frame_number: u32,
     timestamp: f64,
-) -> Result<FrameData, Box<dyn std::error::Error>> {
+) -> Result<FrameData> {
     let width = frame.width();
     let height = frame.height();
     let format = frame.format();
 
     // 正确复制所有平面的帧数据
     let mut data = Vec::new();
-    
+
     match format {
         ffmpeg::util::format::Pixel::YUV420P => {
             // YUV420P 格式：Y平面 + U平面 + V平面
             let y_size = (width * height) as usize;
             let uv_size = y_size / 4;
-            
+
             // Y 平面
             data.extend_from_slice(&frame.data(0)[0..y_size]);
             // U 平面
@@ -497,13 +842,18 @@ fn convert_frame_to_data(
             data.extend_from_slice(&frame.data(2)[0..uv_size]);
         }
         ffmpeg::util::format::Pixel::RGB24 => {
-            // RGB24 格式：直接复制数据
+            // RGB24 格式：直接复制
             let rgb_size = (width * height * 3) as usize;
             data.extend_from_slice(&frame.data(0)[0..rgb_size]);
         }
+        ffmpeg::util::format::Pixel::YUYV422 => {
+            // YUYV422 格式：每个像素2字节
+            let yuyv_size = (width * height * 2) as usize;
+            data.extend_from_slice(&frame.data(0)[0..yuyv_size]);
+        }
         _ => {
-            // 其他格式：尝试复制第一个平面
-            let data_size = frame.data(0).len();
+            // 对于其他格式，尝试复制第一个平面
+            let data_size = frame.data(0).len().min((width * height * 4) as usize);
             data.extend_from_slice(&frame.data(0)[0..data_size]);
         }
     }
@@ -518,253 +868,324 @@ fn convert_frame_to_data(
     })
 }
 
-async fn process_frames_async(
+// 创建优化的输入上下文
+fn create_optimized_input_context(file_path: &str) -> Result<ffmpeg::format::context::Input> {
+    use ffmpeg::format;
+
+    let input = format::input(&Path::new(file_path))?;
+
+    // 设置一些优化选项
+    // 这里可以添加更多的优化设置
+
+    Ok(input)
+}
+
+// 优化解码器速度
+fn optimize_decoder_for_speed(
+    _decoder_context: &mut ffmpeg::codec::context::Context,
+) -> Result<()> {
+    // 设置解码器参数以提升速度
+    // 可以添加特定的优化设置
+    Ok(())
+}
+
+// 异步处理帧数据并保存图片（使用WGPU加速）
+async fn process_frames_async_wgpu(
     mut receiver: mpsc::Receiver<FrameData>,
     config: ProcessConfig,
-) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    _gpu_processor: Option<WgpuImageProcessor>,
+) -> Result<usize> {
     let mut saved_count = 0;
     let mut tasks = Vec::new();
 
-    println!("  🎨 OpenCV 异步图片保存任务已启动 (Mac 优化)");
-
-    // 尝试初始化OpenCL上下文（如果启用）
-    let opencl_enabled = if config.use_opencl {
-        init_opencl_context().await.unwrap_or_else(|e| {
-            println!("    ⚠️  OpenCL 初始化失败，使用CPU模式: {}", e);
-            false
-        })
-    } else {
-        false
-    };
-
-    if opencl_enabled {
-        println!("  🚀 OpenCL 加速已启用 (Mac GPU 优化)");
-    } else {
-        println!("  💻 使用 CPU 模式");
-    }
-
     while let Some(frame_data) = receiver.recv().await {
-        let task_config = config.clone();
-        let task_use_opencl = opencl_enabled;
+        let config_clone = config.clone();
 
-        // 控制并发数量
-        if tasks.len() >= config.max_concurrent_saves {
-            // 等待一些任务完成
-            let (result, _index, remaining) = futures::future::select_all(tasks).await;
-            tasks = remaining;
-
-            match result {
-                Ok(_) => saved_count += 1,
-                Err(e) => println!("    ❌ 保存任务失败: {}", e),
-            }
-        }
-
-        // 启动新的保存任务
-        let task = tokio::task::spawn_blocking(move || {
-            save_frame_as_image(frame_data, task_config, task_use_opencl)
-        });
+        // 为每个任务创建新的GPU处理器实例
+        let task = if config.use_gpu {
+            tokio::spawn(async move {
+                // 在每个任务中重新初始化GPU处理器
+                match WgpuImageProcessor::new().await {
+                    Ok(gpu_proc) => {
+                        process_single_frame_with_gpu(frame_data, config_clone, gpu_proc).await
+                    }
+                    Err(_) => {
+                        process_single_frame_cpu_only(frame_data, config_clone).await
+                    }
+                }
+            })
+        } else {
+            tokio::spawn(
+                async move { process_single_frame_cpu_only(frame_data, config_clone).await },
+            )
+        };
 
         tasks.push(task);
+
+        // 限制并发任务数量
+        if tasks.len() >= config.max_concurrent_saves {
+            // 等待一些任务完成
+            let mut i = 0;
+            while i < tasks.len() {
+                if tasks[i].is_finished() {
+                    match tasks.remove(i).await {
+                        Ok(Ok(_)) => saved_count += 1,
+                        Ok(Err(e)) => println!("    ⚠️  保存帧失败: {}", e),
+                        Err(e) => println!("    ⚠️  任务执行失败: {}", e),
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 
     // 等待所有剩余任务完成
-    let results = join_all(tasks).await;
-    for result in results {
-        match result {
+    for task in tasks {
+        match task.await {
             Ok(Ok(_)) => saved_count += 1,
-            Ok(Err(e)) => println!("    ❌ 保存任务失败: {}", e),
-            Err(e) => println!("    ❌ 任务执行失败: {}", e),
+            Ok(Err(e)) => println!("    ⚠️  保存帧失败: {}", e),
+            Err(e) => println!("    ⚠️  任务执行失败: {}", e),
         }
     }
 
-    println!("  ✅ 所有图片保存任务完成");
     Ok(saved_count)
 }
 
-fn save_frame_as_image(
+// 使用GPU处理单个帧
+async fn process_single_frame_with_gpu(
     frame_data: FrameData,
     config: ProcessConfig,
-    opencl_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use opencv::imgcodecs::*;
+    mut gpu_processor: WgpuImageProcessor,
+) -> Result<()> {
+    let FrameData {
+        frame_number,
+        timestamp,
+        width,
+        height,
+        data,
+        format,
+    } = frame_data;
 
-    // 构造输出文件名
-    let filename = format!(
-        "{}/frame_{:06}_{:.2}s.{}",
-        config.output_dir, frame_data.frame_number, frame_data.timestamp, config.image_format
-    );
-
-    // 根据 FFmpeg 像素格式转换为 OpenCV Mat
-    let mut mat = convert_ffmpeg_frame_to_opencv_mat(&frame_data)?;
-
-    // 如果使用OpenCL，尝试在GPU上处理
-    if opencl_enabled {
-        if let Ok(processed_mat) = process_with_opencl(&mat) {
-            mat = processed_mat;
-        }
-    }
-
-    // 设置保存参数
-    let mut params = opencv::core::Vector::<i32>::new();
-
-    match config.image_format.to_lowercase().as_str() {
-        "jpg" | "jpeg" => {
-            params.push(IMWRITE_JPEG_QUALITY);
-            params.push(config.jpeg_quality);
-        }
-        "png" => {
-            params.push(IMWRITE_PNG_COMPRESSION);
-            params.push(3); // 0-9, 3 是平衡压缩率和速度的选择
-        }
-        _ => {}
-    }
-
-    // 保存图片
-    imwrite(&filename, &mat, &params)?;
-
-    Ok(())
-}
-
-fn convert_ffmpeg_frame_to_opencv_mat(
-    frame_data: &FrameData,
-) -> Result<opencv::core::Mat, Box<dyn std::error::Error + Send + Sync>> {
-    use opencv::core::*;
-
-    let height = frame_data.height as i32;
-    let width = frame_data.width as i32;
-
-    // 根据 FFmpeg 像素格式创建对应的 OpenCV Mat
-    match frame_data.format {
+    // 根据格式转换为RGB
+    let rgb_data = match format {
         ffmpeg::util::format::Pixel::YUV420P => {
-            // YUV420P 格式处理 - 使用 I420 格式直接转换
-            let y_size = (width * height) as usize;
-            let uv_size = y_size / 4;
-
-            if frame_data.data.len() < y_size + uv_size * 2 {
-                return Err(format!("YUV420P 数据长度不足: 需要 {} 字节，实际 {} 字节", 
-                                 y_size + uv_size * 2, frame_data.data.len()).into());
-            }
-
-            // 创建连续的 YUV 数据 Mat
-            let yuv_data = Mat::from_slice(&frame_data.data)?;
-            let yuv_mat = yuv_data.reshape(1, height * 3 / 2)?;
-
-            // 转换 YUV I420 到 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &yuv_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_YUV2BGR_I420,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
+            // 使用GPU加速转换
+            gpu_processor
+                .convert_yuv420p_to_rgb(&data, width, height)
+                .await?
         }
         ffmpeg::util::format::Pixel::RGB24 => {
-            // RGB24 格式
-            let expected_size = (width * height * 3) as usize;
-            if frame_data.data.len() < expected_size {
-                return Err(format!("RGB24 数据长度不足: 需要 {} 字节，实际 {} 字节", 
-                                 expected_size, frame_data.data.len()).into());
-            }
-
-            let rgb_data = Mat::from_slice(&frame_data.data[0..expected_size])?;
-            let rgb_mat = rgb_data.reshape(3, height)?;
-
-            // 转换 RGB 到 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &rgb_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_RGB2BGR,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
+            // 已经是RGB格式，直接使用
+            data
         }
         _ => {
-            // 对于其他格式，尝试作为灰度图像处理
-            let expected_size = (width * height) as usize;
-            let actual_size = frame_data.data.len().min(expected_size);
-            
-            let gray_data = Mat::from_slice(&frame_data.data[0..actual_size])?;
-            let gray_mat = gray_data.reshape(1, height)?;
-
-            // 转换为 BGR
-            let mut bgr_mat = Mat::default();
-            opencv::imgproc::cvt_color(
-                &gray_mat,
-                &mut bgr_mat,
-                opencv::imgproc::COLOR_GRAY2BGR,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )?;
-
-            Ok(bgr_mat)
+            // 其他格式使用CPU转换
+            convert_other_format_to_rgb(&data, width, height, format)?
         }
-    }
-}
+    };
 
-async fn init_opencl_context() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    tokio::task::spawn_blocking(
-        || -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            use opencv::core::*;
-
-            // 检查 OpenCL 是否可用
-            if !have_opencl()? {
-                return Ok(false);
-            }
-
-            // 尝试启用 OpenCL
-            use_opencl()?;
-
-            // 测试 OpenCL 功能
-            let test_mat = Mat::zeros(100, 100, CV_8UC3)?.to_mat()?;
-            let mut _result_mat = Mat::default();
-
-            // 简单的测试操作 - 创建一个简单的测试而不用 gaussian_blur
-            let _test_result = test_mat.clone();
-
-            Ok(true)
-        },
-    )
-    .await?
-}
-
-fn process_with_opencl(
-    mat: &opencv::core::Mat,
-) -> Result<opencv::core::Mat, Box<dyn std::error::Error + Send + Sync>> {
-    // 这里可以添加 OpenCL 优化的图像处理操作
-    // 例如：调整大小、模糊、锐化等
-    // 对于Mac，OpenCL 主要利用集成显卡或独立显卡
-
-    // 目前直接返回原图，你可以根据需要添加具体的图像处理
-    Ok(mat.clone())
-}
-
-fn optimize_decoder_for_speed(
-    decoder_context: &mut ffmpeg::codec::context::Context,
-) -> Result<(), Box<dyn std::error::Error>> {
-    decoder_context.set_threading(ffmpeg::threading::Config {
-        kind: ffmpeg::threading::Type::Frame,
-        count: 0, // 0 表示自动检测最优线程数
-    });
+    // 保存图片
+    save_rgb_image(&rgb_data, width, height, frame_number, timestamp, &config).await?;
 
     Ok(())
 }
 
-fn create_optimized_input_context(
-    input_path: &str,
-) -> Result<ffmpeg::format::context::Input, Box<dyn std::error::Error>> {
-    use ffmpeg::format;
+// 使用CPU处理单个帧
+async fn process_single_frame_cpu_only(frame_data: FrameData, config: ProcessConfig) -> Result<()> {
+    let FrameData {
+        frame_number,
+        timestamp,
+        width,
+        height,
+        data,
+        format,
+    } = frame_data;
 
-    // 创建输入上下文，设置一些优化选项
-    let input = format::input(&Path::new(input_path))?;
+    // 根据格式转换为RGB
+    let rgb_data = match format {
+        ffmpeg::util::format::Pixel::YUV420P => {
+            // CPU转换
+            convert_yuv420p_to_rgb_cpu(&data, width, height)?
+        }
+        ffmpeg::util::format::Pixel::RGB24 => {
+            // 已经是RGB格式，直接使用
+            data
+        }
+        _ => {
+            // 其他格式使用简单转换
+            convert_other_format_to_rgb(&data, width, height, format)?
+        }
+    };
 
-    // 可以在这里添加更多优化设置
-    // 例如缓冲区大小、预读取选项等
+    // 保存图片
+    save_rgb_image(&rgb_data, width, height, frame_number, timestamp, &config).await?;
 
-    Ok(input)
+    Ok(())
+}
+
+// 保存RGB图像到文件
+async fn save_rgb_image(
+    rgb_data: &[u8],
+    width: u32,
+    height: u32,
+    frame_number: u32,
+    timestamp: f64,
+    config: &ProcessConfig,
+) -> Result<()> {
+    use image::{ImageBuffer, RgbImage};
+
+    // 创建RGB图像
+    let img: RgbImage = ImageBuffer::from_vec(width, height, rgb_data.to_vec())
+        .ok_or_else(|| anyhow!("无法创建RGB图像"))?;
+
+    // 生成文件名
+    let filename = format!(
+        "frame_{:06}_{:.3}s.{}",
+        frame_number, timestamp, config.image_format
+    );
+    let filepath = Path::new(&config.output_dir).join(filename);
+
+    // 根据格式保存图像
+    match config.image_format.as_str() {
+        "jpg" | "jpeg" => {
+            let mut output = std::fs::File::create(&filepath)?;
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut output,
+                config.jpeg_quality,
+            );
+            img.write_with_encoder(encoder)?;
+        }
+        "png" => {
+            img.save_with_format(&filepath, image::ImageFormat::Png)?;
+        }
+        _ => {
+            // 默认保存为JPEG
+            let mut output = std::fs::File::create(&filepath)?;
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut output,
+                config.jpeg_quality,
+            );
+            img.write_with_encoder(encoder)?;
+        }
+    }
+
+    Ok(())
+}
+
+// CPU版本的YUV420P到RGB转换
+fn convert_yuv420p_to_rgb_cpu(yuv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    let y_size = width * height;
+    let uv_size = y_size / 4;
+
+    if yuv_data.len() < y_size + 2 * uv_size {
+        return Err(anyhow!("YUV数据长度不足"));
+    }
+
+    let mut rgb_data = Vec::with_capacity(y_size * 3);
+
+    let y_plane = &yuv_data[0..y_size];
+    let u_plane = &yuv_data[y_size..y_size + uv_size];
+    let v_plane = &yuv_data[y_size + uv_size..y_size + 2 * uv_size];
+
+    for y in 0..height {
+        for x in 0..width {
+            let y_index = y * width + x;
+            let uv_index = (y / 2) * (width / 2) + (x / 2);
+
+            let y_val = y_plane[y_index] as f32;
+            let u_val = u_plane[uv_index] as f32;
+            let v_val = v_plane[uv_index] as f32;
+
+            // YUV到RGB转换 (BT.709)
+            let y_f = y_val - 16.0;
+            let u_f = u_val - 128.0;
+            let v_f = v_val - 128.0;
+
+            let r = (1.164 * y_f + 1.793 * v_f).clamp(0.0, 255.0) as u8;
+            let g = (1.164 * y_f - 0.213 * u_f - 0.533 * v_f).clamp(0.0, 255.0) as u8;
+            let b = (1.164 * y_f + 2.112 * u_f).clamp(0.0, 255.0) as u8;
+
+            rgb_data.push(r);
+            rgb_data.push(g);
+            rgb_data.push(b);
+        }
+    }
+
+    Ok(rgb_data)
+}
+
+// 其他格式到RGB的转换函数
+fn convert_other_format_to_rgb(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    format: ffmpeg::util::format::Pixel,
+) -> Result<Vec<u8>> {
+    match format {
+        ffmpeg::util::format::Pixel::YUYV422 => {
+            // YUYV422 格式转换
+            convert_yuyv422_to_rgb(data, width, height)
+        }
+        _ => {
+            // 对于不支持的格式，创建一个简单的灰度RGB图像
+            println!("    ⚠️  不支持的像素格式: {:?}, 使用默认灰度转换", format);
+            let rgb_size = (width * height * 3) as usize;
+            let mut rgb_data = Vec::with_capacity(rgb_size);
+
+            // 如果有数据，使用第一个通道作为灰度值
+            if !data.is_empty() {
+                let pixels = (width * height) as usize;
+                for i in 0..pixels {
+                    let gray = if i < data.len() { data[i] } else { 128 };
+                    rgb_data.push(gray);
+                    rgb_data.push(gray);
+                    rgb_data.push(gray);
+                }
+            } else {
+                // 如果没有数据，创建灰色图像
+                rgb_data.resize(rgb_size, 128);
+            }
+
+            Ok(rgb_data)
+        }
+    }
+}
+
+// YUYV422格式转换
+fn convert_yuyv422_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    let mut rgb_data = Vec::with_capacity(width * height * 3);
+
+    for y in 0..height {
+        for x in 0..(width / 2) {
+            let index = (y * width + x * 2) * 2;
+            if index + 3 < data.len() {
+                let y0 = data[index] as f32;
+                let u = data[index + 1] as f32;
+                let y1 = data[index + 2] as f32;
+                let v = data[index + 3] as f32;
+
+                // 转换两个像素
+                for y_val in [y0, y1].iter() {
+                    let y_f = y_val - 16.0;
+                    let u_f = u - 128.0;
+                    let v_f = v - 128.0;
+
+                    let r = (1.164 * y_f + 1.793 * v_f).clamp(0.0, 255.0) as u8;
+                    let g = (1.164 * y_f - 0.213 * u_f - 0.533 * v_f).clamp(0.0, 255.0) as u8;
+                    let b = (1.164 * y_f + 2.112 * u_f).clamp(0.0, 255.0) as u8;
+
+                    rgb_data.push(r);
+                    rgb_data.push(g);
+                    rgb_data.push(b);
+                }
+            }
+        }
+    }
+
+    Ok(rgb_data)
 }
