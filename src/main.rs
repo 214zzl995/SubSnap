@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use ffmpeg_next as ffmpeg;
-use std::path::Path;
-use tokio::sync::mpsc;
+use std::{path::Path, sync::Arc}; // Added Arc
+use tokio::sync::{mpsc, Mutex}; // Added Mutex
 use wgpu::util::DeviceExt;
 
 const SAVE_ENABLED: bool = true; // 是否启用保存图片功能
@@ -211,17 +211,17 @@ impl WgpuImageProcessor {
                 let u_buf = self.create_padded_buffer(u_plane, "U Plane Buffer");
                 let v_buf = self.create_padded_buffer(v_plane, "V Plane Buffer");
                 
-                let rgba_size = (width * height * 4) as u64;
+                let rgb_size = (width * height * 3) as u64; // Changed from rgba_size to rgb_size (4 to 3)
                 let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("RGBA Output Buffer"),
-                    size: rgba_size,
+                    label: Some("RGB Output Buffer"), // Changed label
+                    size: rgb_size, // Use rgb_size
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
 
                 let read_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Read Buffer"),
-                    size: rgba_size,
+                    size: rgb_size, // Use rgb_size
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 });
@@ -318,7 +318,7 @@ impl WgpuImageProcessor {
         }
 
         // 复制数据到读取缓冲区
-        encoder.copy_buffer_to_buffer(output_buffer, 0, read_buffer, 0, (width * height * 4) as u64);
+        encoder.copy_buffer_to_buffer(output_buffer, 0, read_buffer, 0, (width * height * 3) as u64); // Use * 3
 
         // 提交命令
         self.queue.submit(Some(encoder.finish()));
@@ -334,31 +334,11 @@ impl WgpuImageProcessor {
         receiver.await.map_err(|_| anyhow::anyhow!("Failed to receive buffer mapping result"))??;
 
         let data = buffer_slice.get_mapped_range();
-        let rgba_data = data.to_vec();
+        let rgb_output = data.to_vec(); // Shader now outputs RGB directly
         drop(data);
         read_buffer.unmap();
 
-        // 将RGBA数据转换为RGB数据
-        let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
-
-        // 按u32读取RGBA数据并转换为RGB
-        for chunk in rgba_data.chunks_exact(4) {
-            if chunk.len() == 4 {
-                let rgba_u32 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-
-                // 从u32中提取RGBA分量 (我们之前打包为 A<<24 | B<<16 | G<<8 | R)
-                let r = (rgba_u32 & 0xFF) as u8;
-                let g = ((rgba_u32 >> 8) & 0xFF) as u8;
-                let b = ((rgba_u32 >> 16) & 0xFF) as u8;
-                // A分量被忽略
-
-                rgb_data.push(r);
-                rgb_data.push(g);
-                rgb_data.push(b);
-            }
-        }
-
-        Ok(rgb_data)
+        Ok(rgb_output) // Return the direct RGB data
     }
 
     // 创建填充的缓冲区，确保大小是4的倍数
@@ -592,11 +572,11 @@ async fn demo_frame_extraction_with_wgpu(config: ProcessConfig) -> Result<()> {
     }
 
     // 初始化 WGPU 处理器
-    let gpu_processor = if config.use_gpu {
+    let gpu_processor_arc: Option<Arc<Mutex<WgpuImageProcessor>>> = if config.use_gpu {
         match WgpuImageProcessor::new().await {
             Ok(processor) => {
-                println!("  🚀 WGPU GPU 处理器初始化成功");
-                Some(processor)
+                println!("  🚀 Shared WGPU GPU 处理器初始化成功");
+                Some(Arc::new(Mutex::new(processor)))
             }
             Err(e) => {
                 println!("  ⚠️  GPU 初始化失败，使用CPU模式: {}", e);
@@ -664,8 +644,10 @@ async fn demo_frame_extraction_with_wgpu(config: ProcessConfig) -> Result<()> {
     // 启动异步图片保存任务（仅在需要时）
     let save_handle = if let Some(receiver) = frame_receiver {
         let save_config = config.clone();
+        // Clone the Arc for the save task
+        let gpu_processor_for_save = gpu_processor_arc.clone();
         Some(tokio::spawn(async move {
-            process_frames_async_wgpu(receiver, save_config, gpu_processor).await
+            process_frames_async_wgpu(receiver, save_config, gpu_processor_for_save).await
         }))
     } else {
         None
@@ -893,28 +875,23 @@ fn optimize_decoder_for_speed(
 async fn process_frames_async_wgpu(
     mut receiver: mpsc::Receiver<FrameData>,
     config: ProcessConfig,
-    _gpu_processor: Option<WgpuImageProcessor>,
+    gpu_processor: Option<Arc<Mutex<WgpuImageProcessor>>>,
 ) -> Result<usize> {
     let mut saved_count = 0;
     let mut tasks = Vec::new();
 
     while let Some(frame_data) = receiver.recv().await {
         let config_clone = config.clone();
+        let gpu_processor_clone = gpu_processor.clone(); // Clone Arc for the new task
 
-        // 为每个任务创建新的GPU处理器实例
-        let task = if config.use_gpu {
+        let task = if config.use_gpu && gpu_processor_clone.is_some() {
             tokio::spawn(async move {
-                // 在每个任务中重新初始化GPU处理器
-                match WgpuImageProcessor::new().await {
-                    Ok(gpu_proc) => {
-                        process_single_frame_with_gpu(frame_data, config_clone, gpu_proc).await
-                    }
-                    Err(_) => {
-                        process_single_frame_cpu_only(frame_data, config_clone).await
-                    }
-                }
+                // GPU processor is Some, so we can unwrap safely after this check
+                // Pass the cloned Arc to the processing function
+                process_single_frame_with_gpu(frame_data, config_clone, gpu_processor_clone.unwrap()).await
             })
         } else {
+            // Fallback to CPU if GPU is not requested or not available
             tokio::spawn(
                 async move { process_single_frame_cpu_only(frame_data, config_clone).await },
             )
@@ -956,7 +933,7 @@ async fn process_frames_async_wgpu(
 async fn process_single_frame_with_gpu(
     frame_data: FrameData,
     config: ProcessConfig,
-    mut gpu_processor: WgpuImageProcessor,
+    gpu_processor: Arc<Mutex<WgpuImageProcessor>>,
 ) -> Result<()> {
     let FrameData {
         frame_number,
@@ -971,7 +948,8 @@ async fn process_single_frame_with_gpu(
     let rgb_data = match format {
         ffmpeg::util::format::Pixel::YUV420P => {
             // 使用GPU加速转换
-            gpu_processor
+            let mut processor_guard = gpu_processor.lock().await;
+            processor_guard
                 .convert_yuv420p_to_rgb(&data, width, height)
                 .await?
         }

@@ -11,7 +11,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> y_plane: array<u32>;
 @group(0) @binding(1) var<storage, read> u_plane: array<u32>;
 @group(0) @binding(2) var<storage, read> v_plane: array<u32>;
-@group(0) @binding(3) var<storage, read_write> rgb_data: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgb_data: array<u8>; // Changed to array<u8>
 @group(0) @binding(4) var<uniform> params: Params;
 
 // 优化工作组大小为16x16，更好的GPU占用率
@@ -55,8 +55,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     g = saturate_fast(g);
     b = saturate_fast(b);
     
-    // 直接计算输出索引并打包（优化的位操作）
-    rgb_data[y_idx] = pack_rgb_fast(u32(r), u32(g), u32(b));
+    // Calculate base byte index for RGB output
+    let base_idx = y_idx * 3u;
+
+    // Write R, G, B components directly as bytes
+    rgb_data[base_idx + 0u] = u8(r);
+    rgb_data[base_idx + 1u] = u8(g);
+    rgb_data[base_idx + 2u] = u8(b);
 }
 
 // 优化的字节提取函数
@@ -69,9 +74,6 @@ fn saturate_fast(value: f32) -> f32 {
     return clamp(value, 0.0, 255.0);
 }
 
-// 优化的RGB打包
-fn pack_rgb_fast(r: u32, g: u32, b: u32) -> u32 {
-    return 0xFF000000u | (b << 16u) | (g << 8u) | r;
-}
+// pack_rgb_fast function is no longer needed
 
 
