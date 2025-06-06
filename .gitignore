@@ -1,2 +1,3 @@
 /target
-/input.mp4
+/input*.mp4
+/extracted_frames
