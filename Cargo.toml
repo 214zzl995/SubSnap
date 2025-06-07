@@ -11,6 +11,14 @@ futures = "0.3"
 anyhow = "1.0"
 image = "0.25"
 num_cpus = "1.17.0"
+rayon = "1.8"           # 并行计算库
+crossbeam-channel = "0.5" # 高性能无锁通道
+crossbeam-utils = "0.8"   # 跨线程工具
+parking_lot = "0.12"      # 高性能锁
+memmap2 = "0.9"          # 内存映射文件
+simd-json = "0.13"       # SIMD优化JSON处理
+bytemuck = "1.14"        # 安全的字节转换
+aligned-vec = "0.5"      # 内存对齐向量
 
 # 性能优化配置
 [profile.release]
