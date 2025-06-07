@@ -4,8 +4,47 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# FFmpeg核心依赖
 ffmpeg-next = "7.0"
-opencv = { version = "0.94.4", features = ["clang-runtime"] }
+anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
-anyhow = "1.0"
+
+# OpenCV依赖（原有的）
+opencv = { version = "0.94.4", features = ["clang-runtime"] }
+
+# 命令行界面
+clap = { version = "4.4", features = ["derive"] }
+async-trait = "0.1"
+
+# WGPU GPU加速模式依赖
+wgpu = { version = "25.0", optional = true }
+bytemuck = { version = "1.14", optional = true }
+pollster = { version = "0.3", optional = true }
+
+# yuvutils-rs模式依赖
+yuvutils-rs = { version = "0.8.3", optional = true }
+rayon = { version = "1.8", optional = true }
+num_cpus = { version = "1.17.0", optional = true }
+
+# 图像处理
+image = { version = "0.24", features = ["jpeg", "png"] }
+
+# 性能优化
+crossbeam-channel = { version = "0.5", optional = true }
+parking_lot = { version = "0.12", optional = true }
+aligned-vec = { version = "0.5", optional = true }
+
+[features]
+default = ["opencv-mode"]
+opencv-mode = []
+wgpu-mode = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+yuvutils-mode = ["dep:yuvutils-rs", "dep:rayon", "dep:num_cpus", "dep:crossbeam-channel", "dep:parking_lot", "dep:aligned-vec"]
+all-modes = ["opencv-mode", "wgpu-mode", "yuvutils-mode"]
+
+# 性能优化配置
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
