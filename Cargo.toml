@@ -5,8 +5,31 @@ edition = "2021"
 
 [dependencies]
 ffmpeg-next = "7.0"
-yuvutils-rs = "0.8.3"
+yuvutils-rs = "0.8.3" # 高性能YUV转换库
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 anyhow = "1.0"
 image = "0.25"
+num_cpus = "1.17.0"
+
+# 性能优化配置
+[profile.release]
+opt-level = 3          # 最高优化级别
+lto = true            # 链接时优化
+codegen-units = 1     # 单个代码生成单元以获得最佳优化
+panic = "abort"       # 减少二进制大小
+strip = true          # 移除调试符号
+
+# 开发时的性能配置
+[profile.dev]
+opt-level = 1         # 开发时适度优化以提高编译速度
+
+# 针对特定依赖的优化
+[profile.release.package.yuvutils-rs]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.ffmpeg-next]
+opt-level = 3

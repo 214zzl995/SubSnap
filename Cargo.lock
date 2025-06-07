@@ -1181,6 +1181,7 @@ dependencies = [
  "ffmpeg-next",
  "futures",
  "image",
+ "num_cpus",
  "tokio",
  "yuvutils-rs",
 ]
