@@ -8,14 +8,18 @@ pub struct ProcessingResult {
     pub total_duration: std::time::Duration,
 }
 
-pub async fn extract_frames_streaming(
+pub async fn extract_convert_save_streaming(
     input_path: &str,
     max_frames: u32,
     sample_fps: u32,
-    sender: tokio::sync::mpsc::Sender<crate::converters::ChannelFrameData>,
+    mode: crate::converters::ConversionMode,
+    output_dir: Option<&str>,
 ) -> Result<ProcessingResult> {
-    use crate::converters::ChannelFrameData;
+    use std::fs;
+    use image::{ImageBuffer, Rgb};
+    use crate::converters::{ConverterFactory, FrameData};
 
+    let mut converter = ConverterFactory::create_converter(mode).await?;
     let mut input = create_optimized_input_context(input_path)?;
     
     let video_stream_index = input.streams()
@@ -68,7 +72,13 @@ pub async fn extract_frames_streaming(
              video_duration_seconds, total_video_frames, final_output_frames, frame_interval);
     
     let mut next_extract_time = 0.0;
+    
+    if let Some(output_dir) = output_dir {
+        fs::create_dir_all(output_dir)?;
+    }
+
     let mut frame_count = 0;
+    let mut _saved_count = 0;
     let start_time = std::time::Instant::now();
 
     for (stream, packet) in input.packets() {
@@ -97,16 +107,37 @@ pub async fn extract_frames_streaming(
                 
                 let frame_data = extract_yuv_data(&decoded)?;
 
-                let channel_frame = ChannelFrameData {
+                let frame = FrameData {
                     frame_number: frame_count,
                     width: decoded.width(),
                     height: decoded.height(),
-                    yuv_data: frame_data,
+                    data: frame_data,
                     format: decoded.format(),
                 };
 
-                if sender.send(channel_frame).await.is_err() {
-                    break; 
+                match converter.convert(&frame).await {
+                    Ok(rgb_data) => {
+                        if let Some(output_dir) = output_dir {
+                            let img = ImageBuffer::<Rgb<u8>, _>::from_raw(
+                                frame.width,
+                                frame.height,
+                                rgb_data,
+                            ).ok_or_else(|| anyhow::anyhow!("无法创建图像缓冲区"))?;
+
+                            let filename = format!(
+                                "{}/frame_{}_{:04}.jpg",
+                                output_dir,
+                                mode.as_str(),
+                                frame.frame_number
+                            );
+                            
+                            img.save(&filename)?;
+                            _saved_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("转换帧#{} 失败: {}", frame.frame_number, e);
+                    }
                 }
                 
                 if frame_count >= final_output_frames {
@@ -121,6 +152,7 @@ pub async fn extract_frames_streaming(
     }
 
     let total_duration = start_time.elapsed();
+    converter.cleanup().await?;
 
     Ok(ProcessingResult {
         frames_processed: frame_count,
@@ -135,6 +167,7 @@ fn extract_yuv_data(decoded: &ffmpeg::util::frame::video::Video) -> Result<Vec<u
         let width = decoded.width() as usize;
         let height = decoded.height() as usize;
         
+        // Y平面
         let y_plane = decoded.data(0);
         let y_stride = decoded.stride(0) as usize;
         for y in 0..height {
@@ -143,6 +176,7 @@ fn extract_yuv_data(decoded: &ffmpeg::util::frame::video::Video) -> Result<Vec<u
             frame_data.extend_from_slice(&y_plane[start..end]);
         }
         
+        // U平面
         let u_plane = decoded.data(1);
         let u_stride = decoded.stride(1) as usize;
         let uv_width = width / 2;
@@ -152,7 +186,8 @@ fn extract_yuv_data(decoded: &ffmpeg::util::frame::video::Video) -> Result<Vec<u
             let end = start + uv_width;
             frame_data.extend_from_slice(&u_plane[start..end]);
         }
-            
+        
+        // V平面
         let v_plane = decoded.data(2);
         let v_stride = decoded.stride(2) as usize;
         for y in 0..uv_height {

@@ -32,18 +32,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let local = tokio::task::LocalSet::new();
-    
-    local.run_until(async {
-        if cli.benchmark {
-            run_benchmark(&cli).await?;
-        } else if let Some(mode) = cli.mode {
-            run_single_mode(mode.into(), &cli).await?;
-        } else {
-            show_help_and_demo(&cli).await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    }).await?;
+    if cli.benchmark {
+        run_benchmark(&cli).await?;
+    } else if let Some(mode) = cli.mode {
+        run_single_mode(mode.into(), &cli).await?;
+    } else {
+        show_help_and_demo(&cli).await?;
+    }
 
     Ok(())
 }
