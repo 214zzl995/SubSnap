@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::converter::{YuvToRgbConverter, FrameData, ConversionMode};
+use crate::converters::{YuvToRgbConverter, FrameData};
 
 /// WGPU GPU加速转换器
 /// 
@@ -26,7 +26,4 @@ impl YuvToRgbConverter for WgpuConverter {
         }
     }
 
-    fn get_mode(&self) -> ConversionMode {
-        ConversionMode::Wgpu
-    }
 } 

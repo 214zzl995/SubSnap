@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::converter::{YuvToRgbConverter, FrameData, ConversionMode};
+use crate::converters::{YuvToRgbConverter, FrameData};
 
 /// 手工实现的YUV转换器
 /// 
@@ -60,7 +60,4 @@ impl YuvToRgbConverter for ManualConverter {
         Ok(rgb_data)
     }
 
-    fn get_mode(&self) -> ConversionMode {
-        ConversionMode::Manual
-    }
 } 

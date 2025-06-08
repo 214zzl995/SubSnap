@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::converter::{YuvToRgbConverter, FrameData, ConversionMode};
+use crate::converters::{YuvToRgbConverter, FrameData};
 
 /// YuvUtils-rs高性能转换器
 /// 
@@ -59,7 +59,4 @@ impl YuvToRgbConverter for YuvutilsConverter {
         Ok(rgb_data)
     }
 
-    fn get_mode(&self) -> ConversionMode {
-        ConversionMode::Yuvutils
-    }
 } 

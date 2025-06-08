@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::converter::{YuvToRgbConverter, FrameData, ConversionMode};
+use crate::converters::{YuvToRgbConverter, FrameData};
 
 /// OpenCV库转换器
 /// 
@@ -60,7 +60,4 @@ impl YuvToRgbConverter for OpencvConverter {
         }
     }
 
-    fn get_mode(&self) -> ConversionMode {
-        ConversionMode::Opencv
-    }
 } 

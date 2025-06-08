@@ -30,13 +30,16 @@ num_cpus = { version = "1.17.0", optional = true }
 # 图像处理
 image = { version = "0.24", features = ["jpeg", "png"] }
 
+# 表格显示
+tabled = "0.15"
+
 # 性能优化
 crossbeam-channel = { version = "0.5", optional = true }
 parking_lot = { version = "0.12", optional = true }
 aligned-vec = { version = "0.5", optional = true }
 
 [features]
-default = ["opencv-mode"]
+default = ["all-modes"]
 opencv-mode = []
 wgpu-mode = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 yuvutils-mode = ["dep:yuvutils-rs", "dep:rayon", "dep:num_cpus", "dep:crossbeam-channel", "dep:parking_lot", "dep:aligned-vec"]

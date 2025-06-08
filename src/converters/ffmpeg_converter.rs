@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::converter::{YuvToRgbConverter, FrameData, ConversionMode};
+use crate::converters::{YuvToRgbConverter, FrameData};
 
 /// FFmpeg SWScale转换器
 /// 
@@ -114,7 +114,4 @@ impl YuvToRgbConverter for FfmpegConverter {
         Ok(rgb_data)
     }
 
-    fn get_mode(&self) -> ConversionMode {
-        ConversionMode::Ffmpeg
-    }
 } 
