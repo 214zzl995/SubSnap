@@ -4,7 +4,7 @@ use ffmpeg_next as ffmpeg;
 
 mod cli;
 mod converters;
-mod wgpu_processor;
+
 mod frame_extraction;
 mod runner;
 mod app;

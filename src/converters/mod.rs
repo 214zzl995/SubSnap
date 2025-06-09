@@ -16,6 +16,7 @@ impl ConversionMode {
             ConversionMode::OpenCV => "opencv",
             ConversionMode::Manual => "manual",
             ConversionMode::WGPU => "wgpu",
+
             ConversionMode::Yuvutils => "yuvutils",
         }
     }
@@ -26,6 +27,7 @@ impl ConversionMode {
             ConversionMode::OpenCV => "使用OpenCV库进行CPU转换",
             ConversionMode::Manual => "手动实现YUV420P到RGB转换",
             ConversionMode::WGPU => "使用WGPU进行GPU加速转换",
+
             ConversionMode::Yuvutils => "使用yuvutils库进行SIMD优化转换",
         }
     }
@@ -85,40 +87,127 @@ pub async fn process_frame_with_mode(
         fs::create_dir_all(output_dir)?;
     }
     
-    let mut converter = ConverterFactory::create_converter(mode).await?;
     let mut processed_count = 0u32;
     
-    while let Some(channel_frame) = receiver.recv().await {
-        let frame_data: FrameData = channel_frame.into();
+    // 特殊处理WGPU模式 - 使用批处理
+    if mode == ConversionMode::WGPU {
+        let mut frame_batch = Vec::new();
         
-        match converter.convert(&frame_data).await {
-            Ok(rgb_data) => {
-                if let Some(ref output_dir) = output_dir {
-                    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(
-                        frame_data.width,
-                        frame_data.height,
-                        rgb_data,
-                    ).ok_or_else(|| anyhow::anyhow!("无法创建图像缓冲区"))?;
+        // 🎯 简化配置：使用固定的大批次，让流式系统自动处理分批
+        const TARGET_BATCH_SIZE: usize = 64; // 固定使用64帧目标批次
+        
+        let mut current_batch_size = 0;
+        
+        while let Some(channel_frame) = receiver.recv().await {
+            let frame_data: FrameData = channel_frame.into();
+            
+            // 🎯 简化配置：直接使用目标批次大小
+            if current_batch_size == 0 {
+                current_batch_size = TARGET_BATCH_SIZE;
+                println!("🚀 [简化批处理] 目标批次: {} 帧 ({}x{} 分辨率) - 流式系统自动分批", 
+                        TARGET_BATCH_SIZE, frame_data.width, frame_data.height);
+            }
+            
+            frame_batch.push(frame_data);
+            
+            // 当批次满了时处理批次
+            if frame_batch.len() >= current_batch_size {
+                let batch_results = process_frame_batch(&frame_batch, &output_dir, &mode).await?;
+                processed_count += batch_results;
+                frame_batch.clear();
+            }
+        }
+        
+        // 处理剩余的帧
+        if !frame_batch.is_empty() {
+            let batch_results = process_frame_batch(&frame_batch, &output_dir, &mode).await?;
+            processed_count += batch_results;
+        }
+    } else {
+        // 原始逐帧处理逻辑
+        let mut converter = ConverterFactory::create_converter(mode).await?;
+        
+        while let Some(channel_frame) = receiver.recv().await {
+            let frame_data: FrameData = channel_frame.into();
+            
+            match converter.convert(&frame_data).await {
+                Ok(rgb_data) => {
+                    if let Some(ref output_dir) = output_dir {
+                        let img = ImageBuffer::<Rgb<u8>, _>::from_raw(
+                            frame_data.width,
+                            frame_data.height,
+                            rgb_data,
+                        ).ok_or_else(|| anyhow::anyhow!("无法创建图像缓冲区"))?;
 
-                    let filename = format!(
-                        "{}/frame_{}_{:04}.jpg",
-                        output_dir,
-                        mode.as_str(),
-                        frame_data.frame_number
-                    );
-                    
-                    img.save(&filename)?;
+                        let filename = format!(
+                            "{}/frame_{}_{:04}.jpg",
+                            output_dir,
+                            mode.as_str(),
+                            frame_data.frame_number
+                        );
+                        
+                        img.save(&filename)?;
+                    }
+                    processed_count += 1;
                 }
-                processed_count += 1;
+                Err(e) => {
+                    eprintln!("转换帧#{} 失败: {}", frame_data.frame_number, e);
+                }
             }
-            Err(e) => {
-                eprintln!("转换帧#{} 失败: {}", frame_data.frame_number, e);
-            }
+        }
+        
+        converter.cleanup().await?;
+    }
+    
+    Ok(processed_count)
+}
+
+/// 处理一个批次的帧 - 真正的批处理实现
+async fn process_frame_batch(
+    frame_batch: &[FrameData],
+    output_dir: &Option<String>,
+    mode: &ConversionMode,
+) -> Result<u32> {
+    use image::{ImageBuffer, Rgb};
+    
+    if frame_batch.is_empty() {
+        return Ok(0);
+    }
+    
+    // 创建GPU处理器并直接调用批处理方法
+    let mut processor = crate::converters::wgpu_converter::GpuImageProcessor::new().await?;
+    
+    // 准备批处理数据
+    let batch_data: Vec<(Vec<u8>, u32, u32)> = frame_batch
+        .iter()
+        .map(|frame| (frame.data.clone(), frame.width, frame.height))
+        .collect();
+    
+    // 🚀 执行GPU批处理转换
+    let batch_results = processor.convert_yuv420p_to_rgb(&batch_data).await?;
+    
+    // 保存结果
+    for (frame_idx, rgb_data) in batch_results.iter().enumerate() {
+        if let Some(ref output_dir) = output_dir {
+            let frame = &frame_batch[frame_idx];
+            let img = ImageBuffer::<Rgb<u8>, _>::from_raw(
+                frame.width,
+                frame.height,
+                rgb_data.clone(),
+            ).ok_or_else(|| anyhow::anyhow!("无法创建图像缓冲区"))?;
+
+            let filename = format!(
+                "{}/frame_{}_{:04}.jpg",
+                output_dir,
+                mode.as_str(),
+                frame.frame_number
+            );
+            
+            img.save(&filename)?;
         }
     }
     
-    converter.cleanup().await?;
-    Ok(processed_count)
+    Ok(batch_results.len() as u32)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -142,7 +231,7 @@ impl ConverterFactory {
                 Ok(Box::new(crate::converters::manual_converter::ManualConverter::new()))
             }
             ConversionMode::WGPU => {
-                Ok(Box::new(crate::converters::wgpu_converter::WgpuConverter::new().await?))
+                Ok(Box::new(crate::converters::wgpu_converter::WgpuBatchConverter::new(true, None, None).await?))
             }
             ConversionMode::Yuvutils => {
                 Ok(Box::new(crate::converters::yuvutils_converter::YuvutilsConverter::new()))
