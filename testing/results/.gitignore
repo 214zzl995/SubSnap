@@ -1,0 +1,8 @@
+# 忽略所有测试结果文件
+*
+
+# 但保留 .gitignore 本身
+!.gitignore
+
+# 可选：保留 README.md 或其他文档文件
+# !README.md

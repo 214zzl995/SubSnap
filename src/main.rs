@@ -6,12 +6,12 @@ mod cli;
 mod converters;
 mod wgpu_processor;
 mod frame_extraction;
-mod benchmark;
+mod runner;
 mod app;
 
 use cli::Cli;
 use app::{list_available_modes, show_help_and_demo};
-use benchmark::{run_benchmark, run_single_mode};
+use runner::run_single_mode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,9 +35,7 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     
     local.run_until(async {
-        if cli.benchmark {
-            run_benchmark(&cli).await?;
-        } else if let Some(mode) = cli.mode {
+        if let Some(mode) = cli.mode {
             run_single_mode(mode.into(), &cli).await?;
         } else {
             show_help_and_demo(&cli).await?;

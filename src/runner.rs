@@ -3,11 +3,6 @@ use std::path::Path;
 use crate::converters::ConversionMode;
 use crate::cli::Cli;
 
-pub async fn run_benchmark(_cli: &Cli) -> Result<()> {
-    println!("基准测试功能已移除，请使用单模式测试");
-    Ok(())
-}
-
 pub async fn run_single_mode(mode: ConversionMode, cli: &Cli) -> Result<()> {
     if !Path::new(&cli.input).exists() {
         anyhow::bail!("输入文件不存在: {}", cli.input);

@@ -10,12 +10,8 @@ pub struct Cli {
     #[arg(short, long, value_enum)]
     pub mode: Option<ConversionModeArg>,
 
-    /// 是否运行所有模式的性能对比测试
-    #[arg(short, long)]
-    pub benchmark: bool,
-
     /// 输入视频文件路径
-    #[arg(short, long, default_value = "input.mp4")]
+    #[arg(short, long, default_value = "input1.mp4")]
     pub input: String,
 
     /// 要提取的帧数（用于测试，0 表示提取所有采样帧）
