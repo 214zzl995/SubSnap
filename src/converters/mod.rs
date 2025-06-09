@@ -93,19 +93,16 @@ pub async fn process_frame_with_mode(
     if mode == ConversionMode::WGPU {
         let mut frame_batch = Vec::new();
         
-        // 🎯 简化配置：使用固定的大批次，让流式系统自动处理分批
-        const TARGET_BATCH_SIZE: usize = 64; // 固定使用64帧目标批次
+        const TARGET_BATCH_SIZE: usize = 64;
         
         let mut current_batch_size = 0;
         
         while let Some(channel_frame) = receiver.recv().await {
             let frame_data: FrameData = channel_frame.into();
             
-            // 🎯 简化配置：直接使用目标批次大小
+            // 设置批次大小
             if current_batch_size == 0 {
                 current_batch_size = TARGET_BATCH_SIZE;
-                println!("🚀 [简化批处理] 目标批次: {} 帧 ({}x{} 分辨率) - 流式系统自动分批", 
-                        TARGET_BATCH_SIZE, frame_data.width, frame_data.height);
             }
             
             frame_batch.push(frame_data);
@@ -162,7 +159,7 @@ pub async fn process_frame_with_mode(
     Ok(processed_count)
 }
 
-/// 处理一个批次的帧 - 真正的批处理实现
+/// 处理一个批次的帧
 async fn process_frame_batch(
     frame_batch: &[FrameData],
     output_dir: &Option<String>,
@@ -174,19 +171,15 @@ async fn process_frame_batch(
         return Ok(0);
     }
     
-    // 创建GPU处理器并直接调用批处理方法
     let mut processor = crate::converters::wgpu_converter::GpuImageProcessor::new().await?;
     
-    // 准备批处理数据
     let batch_data: Vec<(Vec<u8>, u32, u32)> = frame_batch
         .iter()
         .map(|frame| (frame.data.clone(), frame.width, frame.height))
         .collect();
     
-    // 🚀 执行GPU批处理转换
     let batch_results = processor.convert_yuv420p_to_rgb(&batch_data).await?;
     
-    // 保存结果
     for (frame_idx, rgb_data) in batch_results.iter().enumerate() {
         if let Some(ref output_dir) = output_dir {
             let frame = &frame_batch[frame_idx];
