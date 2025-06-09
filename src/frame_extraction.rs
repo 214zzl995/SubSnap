@@ -8,6 +8,37 @@ pub struct ProcessingResult {
     pub total_duration: std::time::Duration,
 }
 
+// 内存池结构，避免频繁分配
+struct FrameDataPool {
+    buffers: Vec<Vec<u8>>,
+    current_index: usize,
+}
+
+impl FrameDataPool {
+    fn new(capacity: usize, buffer_size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buffers.push(Vec::with_capacity(buffer_size));
+        }
+        Self {
+            buffers,
+            current_index: 0,
+        }
+    }
+    
+    fn get_buffer(&mut self, required_size: usize) -> Vec<u8> {
+        let current_idx = self.current_index;
+        self.current_index = (self.current_index + 1) % self.buffers.len();
+        
+        let mut buffer = std::mem::take(&mut self.buffers[current_idx]);
+        buffer.clear();
+        if buffer.capacity() < required_size {
+            buffer.reserve(required_size - buffer.capacity());
+        }
+        buffer
+    }
+}
+
 pub async fn extract_frames_streaming(
     input_path: &str,
     max_frames: u32,
@@ -67,10 +98,15 @@ pub async fn extract_frames_streaming(
     println!("视频信息: 时长={:.2}秒, 总帧数={}, 目标输出帧数={}, 帧间隔={:.4}秒", 
              video_duration_seconds, total_video_frames, final_output_frames, frame_interval);
     
+    // 初始化内存池，估算帧大小
+    let estimated_frame_size = (3840 * 2160 * 3 / 2) as usize; // 假设最大4K分辨率
+    let mut pool = FrameDataPool::new(16, estimated_frame_size); // 增大内存池容量
+    
     let mut next_extract_time = 0.0;
     let mut frame_count = 0;
     let start_time = std::time::Instant::now();
 
+    // 保持原始逻辑，只使用内存池优化
     for (stream, packet) in input.packets() {
         if stream.index() == video_stream_index && frame_count < final_output_frames {
             decoder.send_packet(&packet)?;
@@ -95,7 +131,7 @@ pub async fn extract_frames_streaming(
                 
                 frame_count += 1;
                 
-                let frame_data = extract_yuv_data(&decoded)?;
+                let frame_data = extract_yuv_data_optimized(&decoded, &mut pool)?;
 
                 let channel_frame = ChannelFrameData {
                     frame_number: frame_count,
@@ -128,57 +164,131 @@ pub async fn extract_frames_streaming(
     })
 }
 
-fn extract_yuv_data(decoded: &ffmpeg::util::frame::video::Video) -> Result<Vec<u8>> {
-    let mut frame_data = Vec::new();
-    
+fn extract_yuv_data_optimized(decoded: &ffmpeg::util::frame::video::Video, pool: &mut FrameDataPool) -> Result<Vec<u8>> {
     if decoded.format() == ffmpeg::util::format::Pixel::YUV420P {
         let width = decoded.width() as usize;
         let height = decoded.height() as usize;
+        let y_size = width * height;
+        let uv_size = y_size / 4;
+        let total_size = y_size + 2 * uv_size;
         
+        // 从内存池获取预分配的缓冲区
+        let mut frame_data = pool.get_buffer(total_size);
+        frame_data.reserve_exact(total_size);
+        
+        // 获取各平面数据
         let y_plane = decoded.data(0);
         let y_stride = decoded.stride(0) as usize;
-        for y in 0..height {
-            let start = y * y_stride;
-            let end = start + width;
-            frame_data.extend_from_slice(&y_plane[start..end]);
-        }
-        
         let u_plane = decoded.data(1);
         let u_stride = decoded.stride(1) as usize;
-        let uv_width = width / 2;
-        let uv_height = height / 2;
-        for y in 0..uv_height {
-            let start = y * u_stride;
-            let end = start + uv_width;
-            frame_data.extend_from_slice(&u_plane[start..end]);
-        }
-            
         let v_plane = decoded.data(2);
         let v_stride = decoded.stride(2) as usize;
-        for y in 0..uv_height {
-            let start = y * v_stride;
-            let end = start + uv_width;
-            frame_data.extend_from_slice(&v_plane[start..end]);
+        
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        
+        // 高效拷贝Y平面
+        if y_stride == width {
+            // 无padding，一次性拷贝
+            unsafe {
+                let src_ptr = y_plane.as_ptr();
+                let old_len = frame_data.len();
+                frame_data.set_len(old_len + y_size);
+                std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), y_size);
+            }
+        } else {
+            // 有padding，批量逐行拷贝
+            for y in 0..height {
+                let src_offset = y * y_stride;
+                unsafe {
+                    let src_ptr = y_plane.as_ptr().add(src_offset);
+                    let old_len = frame_data.len();
+                    frame_data.set_len(old_len + width);
+                    std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), width);
+                }
+            }
         }
+        
+        // 高效拷贝U平面
+        if u_stride == uv_width {
+            unsafe {
+                let src_ptr = u_plane.as_ptr();
+                let old_len = frame_data.len();
+                frame_data.set_len(old_len + uv_size);
+                std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), uv_size);
+            }
+        } else {
+            for y in 0..uv_height {
+                let src_offset = y * u_stride;
+                unsafe {
+                    let src_ptr = u_plane.as_ptr().add(src_offset);
+                    let old_len = frame_data.len();
+                    frame_data.set_len(old_len + uv_width);
+                    std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), uv_width);
+                }
+            }
+        }
+        
+        // 高效拷贝V平面
+        if v_stride == uv_width {
+            unsafe {
+                let src_ptr = v_plane.as_ptr();
+                let old_len = frame_data.len();
+                frame_data.set_len(old_len + uv_size);
+                std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), uv_size);
+            }
+        } else {
+            for y in 0..uv_height {
+                let src_offset = y * v_stride;
+                unsafe {
+                    let src_ptr = v_plane.as_ptr().add(src_offset);
+                    let old_len = frame_data.len();
+                    frame_data.set_len(old_len + uv_width);
+                    std::ptr::copy_nonoverlapping(src_ptr, frame_data.as_mut_ptr().add(old_len), uv_width);
+                }
+            }
+        }
+        
+        Ok(frame_data)
     } else {
+        // 非YUV420P格式使用快速拷贝
         let data_size = decoded.data(0).len();
-        frame_data = vec![0u8; data_size];
-        frame_data.copy_from_slice(decoded.data(0));
+        let mut frame_data = pool.get_buffer(data_size);
+        unsafe {
+            frame_data.set_len(data_size);
+            std::ptr::copy_nonoverlapping(decoded.data(0).as_ptr(), frame_data.as_mut_ptr(), data_size);
+        }
+        Ok(frame_data)
     }
-    
-    Ok(frame_data)
 }
 
+
+
 fn optimize_decoder_for_speed(decoder_context: &mut ffmpeg::codec::context::Context) -> Result<()> {
+    // 使用多线程解码
     decoder_context.set_threading(ffmpeg::threading::Config {
         kind: ffmpeg::threading::Type::Frame,
-        count: 0,
+        count: 0, // 自动检测CPU核心数
     });
+    
     Ok(())
 }
 
 fn create_optimized_input_context(input_path: &str) -> Result<ffmpeg::format::context::Input> {
     use ffmpeg::format;
-    let input = format::input(&Path::new(input_path))?;
+    
+    // 创建输入格式选项
+    let mut format_opts = ffmpeg::Dictionary::new();
+    
+    // 设置更大的缓冲区大小和读取优化
+    format_opts.set("buffer_size", "8388608"); // 8MB buffer (更大)
+    format_opts.set("max_delay", "0"); // 无延迟
+    format_opts.set("fflags", "fastseek+genpts"); // 快速seek + 生成PTS
+    format_opts.set("analyzeduration", "500000"); // 进一步减少分析时间
+    format_opts.set("probesize", "1000000"); // 进一步减少探测大小
+    format_opts.set("max_probe_packets", "50"); // 限制探测包数量
+    
+    // 使用优化的格式选项打开输入
+    let input = format::input_with_dictionary(&Path::new(input_path), format_opts)?;
     Ok(input)
 } 
