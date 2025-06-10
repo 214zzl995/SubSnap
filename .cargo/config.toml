@@ -1,0 +1,20 @@
+[build]
+# 启用原生CPU优化以获得最佳性能
+# 这将启用所有可用的CPU指令集，包括SIMD指令
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-apple-darwin]
+# 对于M1/M2 Mac，确保使用原生ARM64优化
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]  
+# ARM64原生优化
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# 启用链接时优化以获得更好的性能
+lto = true
+# 设置代码生成单元数量为1以获得最佳优化
+codegen-units = 1
+# 启用panic=abort以减少二进制大小
+panic = "abort" 

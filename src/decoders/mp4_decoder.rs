@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::BufReader;
 use super::{Decoder, FrameData, FrameDataPool, ProcessingResult};
 
+// 这个方案性能很差 不会用的
+
 /// Network abstraction layer type for H264 packet we might find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NalType {
