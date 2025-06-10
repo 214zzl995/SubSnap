@@ -1,14 +1,13 @@
-use clap::{Parser, ValueEnum};
-use crate::converters::ConversionMode;
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "sub-snap")]
 #[command(about = "SubSnap - 多模式YUV到RGB转换性能测试工具")]
 #[command(version = "0.1.0")]
 pub struct Cli {
-    /// 转换模式
-    #[arg(short, long, value_enum)]
-    pub mode: Option<ConversionModeArg>,
+    /// 转换器类型
+    #[arg(short = 'c', long = "converter", value_enum)]
+    pub converter: Option<crate::converters::ConversionMode>,
 
     /// 输入视频文件路径
     #[arg(short, long, default_value = "input1.mp4")]
@@ -21,6 +20,10 @@ pub struct Cli {
     /// 每秒采样帧数（1表示每秒1帧，0表示提取所有原始帧）
     #[arg(long, default_value = "1")]
     pub fps: u32,
+
+    /// 解码器类型
+    #[arg(short, long, value_enum, default_value = "ffmpeg")]
+    pub decoder: crate::decoders::DecoderType,
 
     /// 是否保存转换后的图片
     #[arg(short, long)]
@@ -39,28 +42,4 @@ pub struct Cli {
     pub verbose: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum ConversionModeArg {
-    /// 使用FFmpeg SWScale进行CPU转换
-    Ffmpeg,
-    /// 使用OpenCV库进行CPU转换
-    Opencv,
-    /// 使用手工实现进行CPU转换
-    Manual,
-    /// 使用WGPU进行GPU加速转换
-    Wgpu,
-    /// 使用yuvutils-rs进行高性能CPU转换
-    Yuvutils,
-}
-
-impl From<ConversionModeArg> for ConversionMode {
-    fn from(arg: ConversionModeArg) -> Self {
-        match arg {
-            ConversionModeArg::Ffmpeg => ConversionMode::FFmpeg,
-            ConversionModeArg::Opencv => ConversionMode::OpenCV,
-            ConversionModeArg::Manual => ConversionMode::Manual,
-            ConversionModeArg::Wgpu => ConversionMode::WGPU,
-            ConversionModeArg::Yuvutils => ConversionMode::Yuvutils,
-        }
-    }
-} 
+ 

@@ -1,11 +1,21 @@
 use anyhow::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum ConversionMode {
+    /// 使用FFmpeg SWScale进行CPU转换
+    #[value(name = "ffmpeg")]
     FFmpeg,
+    /// 使用OpenCV库进行CPU转换
+    #[value(name = "opencv")]
     OpenCV, 
+    /// 使用手工实现进行CPU转换
+    #[value(name = "manual")]
     Manual,
+    /// 使用WGPU进行GPU加速转换
+    #[value(name = "wgpu")]
     WGPU,
+    /// 使用yuvutils-rs进行高性能CPU转换
+    #[value(name = "yuvutils")]
     Yuvutils,
 }
 

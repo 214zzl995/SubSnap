@@ -4,8 +4,7 @@ use ffmpeg_next as ffmpeg;
 
 mod cli;
 mod converters;
-
-mod frame_extraction;
+mod decoders;
 mod runner;
 mod app;
 
@@ -35,8 +34,8 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     
     local.run_until(async {
-        if let Some(mode) = cli.mode {
-            run_single_mode(mode.into(), &cli).await?;
+        if let Some(converter) = cli.converter {
+            run_single_mode(converter, &cli).await?;
         } else {
             show_help_and_demo(&cli).await?;
         }

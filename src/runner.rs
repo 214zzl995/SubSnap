@@ -26,8 +26,10 @@ pub async fn run_single_mode(mode: ConversionMode, cli: &Cli) -> Result<()> {
         crate::converters::process_frame_with_mode(receiver, mode, output_dir).await
     });
     
+    let decoder_type = cli.decoder;
     let extract_task = tokio::task::spawn_local(async move {
-        crate::frame_extraction::extract_frames_streaming(
+        crate::decoders::extract_frames_with_decoder(
+            decoder_type,
             &input_path,
             frames,
             fps,
