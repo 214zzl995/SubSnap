@@ -8,6 +8,9 @@ pub enum DecoderType {
     /// 使用OpenCV解码器
     #[value(name = "opencv")]
     OpenCV,
+    /// 使用MP4解码器
+    #[value(name = "mp4")]
+    Mp4,
 }
 
 impl DecoderType {
@@ -15,6 +18,7 @@ impl DecoderType {
         match self {
             DecoderType::FFmpeg => "ffmpeg",
             DecoderType::OpenCV => "opencv",
+            DecoderType::Mp4 => "mp4",
         }
     }
 
@@ -22,6 +26,7 @@ impl DecoderType {
         match self {
             DecoderType::FFmpeg => "使用FFmpeg库进行视频解码",
             DecoderType::OpenCV => "使用OpenCV库进行视频解码",
+            DecoderType::Mp4 => "使用Rust mp4库进行视频解码",
         }
     }
 }
@@ -114,6 +119,7 @@ impl DecoderFactory {
         match decoder_type {
             DecoderType::FFmpeg => Ok(Box::new(ffmpeg_decoder::FFmpegDecoder::new())),
             DecoderType::OpenCV => Ok(Box::new(opencv_decoder::OpenCVDecoder::new())),
+            DecoderType::Mp4 => Ok(Box::new(mp4_decoder::Mp4Decoder::new())),
         }
     }
 
@@ -121,6 +127,7 @@ impl DecoderFactory {
         vec![
             DecoderType::FFmpeg,
             DecoderType::OpenCV,
+            DecoderType::Mp4,
         ]
     }
 }
@@ -153,4 +160,5 @@ pub async fn extract_frames_with_decoder(
 }
 
 pub mod ffmpeg_decoder;
-pub mod opencv_decoder; 
+pub mod opencv_decoder;
+pub mod mp4_decoder; 

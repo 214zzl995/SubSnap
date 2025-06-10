@@ -13,6 +13,10 @@ futures = "0.3"
 # OpenCV依赖（原有的）
 opencv = { version = "0.94.4", features = ["clang-runtime"] }
 
+# MP4解码库依赖
+mp4 = "0.14"
+openh264 = "0.8"
+
 # 命令行界面
 clap = { version = "4.4", features = ["derive"] }
 async-trait = "0.1"
