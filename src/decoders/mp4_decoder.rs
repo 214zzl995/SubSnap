@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use super::{Decoder, FrameData, FrameDataPool, ProcessingResult};
 
-// 这个方案性能很差 不会用的
+// 这个方案性能很差 不会用的 如果能处理掉 rgb还要转 yuv 然后推过去 和多线程 最后的结果应该 比opencv 差20% 左右吧
 
 /// Network abstraction layer type for H264 packet we might find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
